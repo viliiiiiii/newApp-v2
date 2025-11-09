@@ -99,7 +99,7 @@ $breadcrumbs = build_breadcrumbs($path);
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title><?php echo bc_s($title); ?> - <?php echo bc_s(APP_TITLE); ?></title>
-  <link rel="stylesheet" href="/assets/css/app.css?v=pro-1.1">
+  <link rel="stylesheet" href="/assets/css/app.css?v=pro-2.0">
   <link rel="icon" href="/assets/favicon.ico">
   <meta name="theme-color" content="#f6f9ff">
   <script type="module" src="/assets/js/app.js?v=pro-1.1" defer></script>
