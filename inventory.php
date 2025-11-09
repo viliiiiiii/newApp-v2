@@ -221,6 +221,102 @@ try {
     $errors[] = 'Inventory tables missing in APPS DB (or query failed).';
 }
 
+$totalQuantity = 0;
+$lowStockThreshold = 5;
+$lowStockCount = 0;
+$outOfStockCount = 0;
+$uniqueSkus = 0;
+$sectorBreakdown = [];
+$skuSeen = [];
+
+foreach ($items as $item) {
+    $quantity = (int)($item['quantity'] ?? 0);
+    $totalQuantity += $quantity;
+    if ($quantity === 0) {
+        $outOfStockCount++;
+    } elseif ($quantity <= $lowStockThreshold) {
+        $lowStockCount++;
+    }
+
+    $sku = trim((string)($item['sku'] ?? ''));
+    if ($sku !== '' && !isset($skuSeen[$sku])) {
+        $skuSeen[$sku] = true;
+    }
+
+    $sectorLabel = (string)$item['sector_id'];
+    if (!isset($sectorBreakdown[$sectorLabel])) {
+        $sectorBreakdown[$sectorLabel] = [
+            'items' => 0,
+            'quantity' => 0,
+        ];
+    }
+    $sectorBreakdown[$sectorLabel]['items']++;
+    $sectorBreakdown[$sectorLabel]['quantity'] += $quantity;
+}
+
+$uniqueSkus = count($skuSeen);
+
+$topItems = $items;
+usort($topItems, static function ($a, $b) {
+    return ((int)($b['quantity'] ?? 0)) <=> ((int)($a['quantity'] ?? 0));
+});
+$topItems = array_slice($topItems, 0, 4);
+
+$lowStockItems = array_values(array_filter($items, static function ($item) use ($lowStockThreshold) {
+    return (int)($item['quantity'] ?? 0) <= $lowStockThreshold;
+}));
+usort($lowStockItems, static function ($a, $b) {
+    return ((int)($a['quantity'] ?? 0)) <=> ((int)($b['quantity'] ?? 0));
+});
+$lowStockItems = array_slice($lowStockItems, 0, 5);
+
+$movementPulse = ['in' => 0, 'out' => 0];
+$recentMovements = [];
+
+try {
+    $pulseStmt = $appsPdo->query('SELECT direction, SUM(amount) AS total FROM inventory_movements WHERE ts >= DATE_SUB(NOW(), INTERVAL 30 DAY) GROUP BY direction');
+    foreach ($pulseStmt as $row) {
+        $dir = $row['direction'] === 'out' ? 'out' : 'in';
+        $movementPulse[$dir] = (int)($row['total'] ?? 0);
+    }
+} catch (Throwable $e) {
+    // ignore
+}
+
+try {
+    $recentStmt = $appsPdo->query('SELECT m.*, i.name AS item_name FROM inventory_movements m JOIN inventory_items i ON i.id = m.item_id ORDER BY m.ts DESC LIMIT 12');
+    $recentMovements = $recentStmt ? $recentStmt->fetchAll() : [];
+} catch (Throwable $e) {
+    $recentMovements = [];
+}
+
+if ($recentMovements) {
+    $userIds = [];
+    foreach ($recentMovements as $movement) {
+        $uid = $movement['user_id'] ?? null;
+        if ($uid) {
+            $userIds[(int)$uid] = true;
+        }
+    }
+    if ($userIds) {
+        $placeholders = implode(',', array_fill(0, count($userIds), '?'));
+        try {
+            $userStmt = $corePdo->prepare("SELECT id, CONCAT(first_name, ' ', last_name) AS full_name FROM users WHERE id IN ($placeholders)");
+            $userStmt->execute(array_keys($userIds));
+            $names = [];
+            foreach ($userStmt->fetchAll() as $row) {
+                $names[(int)$row['id']] = trim((string)($row['full_name'] ?? '')) ?: 'User #' . (int)$row['id'];
+            }
+            foreach ($recentMovements as $idx => $movement) {
+                $uid = (int)($movement['user_id'] ?? 0);
+                $recentMovements[$idx]['user_name'] = $uid && isset($names[$uid]) ? $names[$uid] : 'System';
+            }
+        } catch (Throwable $e) {
+            // ignore name lookup failures
+        }
+    }
+}
+
 // --- Helper to resolve sector name ---
 function sector_name_by_id(array $sectors, $id): string {
     foreach ($sectors as $s) {
@@ -229,252 +325,396 @@ function sector_name_by_id(array $sectors, $id): string {
     return '';
 }
 
+$sectorBreakdownDisplay = [];
+foreach ($sectorBreakdown as $sectorId => $stats) {
+    $label = sector_name_by_id((array)$sectorOptions, $sectorId);
+    if ($label === '') {
+        $label = 'Unassigned';
+    }
+    $sectorBreakdownDisplay[] = [
+        'label'    => $label,
+        'items'    => $stats['items'],
+        'quantity' => $stats['quantity'],
+    ];
+}
+usort($sectorBreakdownDisplay, static function ($a, $b) {
+    return $b['quantity'] <=> $a['quantity'];
+});
+
 $title = 'Inventory';
 include __DIR__ . '/includes/header.php';
 ?>
 
-<section class="card">
-  <div class="card-header">
-    <h1>Inventory</h1>
-    <div class="actions">
-      <span class="badge">Items: <?php echo number_format(count($items)); ?></span>
+<section class="inventory-hero">
+  <div class="inventory-hero__inner">
+    <div>
+      <p class="eyebrow">Quantum Inventory Deck</p>
+      <h1>Inventory Command Center</h1>
+      <p class="lead">Monitor velocity, surface weak spots, and orchestrate stock movements with a tactile, future-forward console.</p>
+    </div>
+    <div class="hero-counters">
+      <div class="counter">
+        <span class="counter__label">Items tracked</span>
+        <span class="counter__value"><?php echo number_format(count($items)); ?></span>
+      </div>
+      <div class="counter">
+        <span class="counter__label">Total on hand</span>
+        <span class="counter__value"><?php echo number_format($totalQuantity); ?></span>
+      </div>
+      <div class="counter">
+        <span class="counter__label">Unique SKUs</span>
+        <span class="counter__value"><?php echo number_format($uniqueSkus); ?></span>
+      </div>
+      <div class="counter <?php echo $lowStockCount > 0 ? 'is-alert' : ''; ?>">
+        <span class="counter__label">Low / Out</span>
+        <span class="counter__value"><?php echo number_format($lowStockCount); ?><span class="counter__sub">/<?php echo number_format($outOfStockCount); ?></span></span>
+      </div>
     </div>
   </div>
-
-  <?php if ($errors): ?>
-    <div class="flash flash-error"><?php echo sanitize(implode(' ', $errors)); ?></div>
-  <?php endif; ?>
-
-  <!-- Filter toolbar: mobile stacked, desktop compact via .filters -->
-  <form method="get" class="filters" autocomplete="off">
-    <label>Sector
-      <select name="sector" <?php echo $isRoot ? '' : 'disabled'; ?>>
-        <option value="all" <?php echo ($sectorFilter === '' || $sectorFilter === 'all') ? 'selected' : ''; ?>>All</option>
-        <option value="null" <?php echo $sectorFilter === 'null' ? 'selected' : ''; ?>>Unassigned</option>
-        <?php foreach ((array)$sectorOptions as $sector): ?>
-          <option value="<?php echo (int)$sector['id']; ?>" <?php echo ((string)$sector['id'] === (string)$sectorFilter) ? 'selected' : ''; ?>>
-            <?php echo sanitize((string)$sector['name']); ?>
-          </option>
+  <div class="inventory-hero__pulse">
+    <article>
+      <h2>30 day flow</h2>
+      <dl>
+        <div>
+          <dt>Stock In</dt>
+          <dd><?php echo number_format($movementPulse['in']); ?></dd>
+        </div>
+        <div>
+          <dt>Stock Out</dt>
+          <dd><?php echo number_format($movementPulse['out']); ?></dd>
+        </div>
+      </dl>
+      <p class="tiny muted">Pulse aggregates the last 30 days of recorded movements.</p>
+    </article>
+    <article>
+      <h2>Focus items</h2>
+      <ul>
+        <?php foreach ($lowStockItems as $focus): ?>
+          <li>
+            <strong><?php echo sanitize((string)$focus['name']); ?></strong>
+            <span><?php echo (int)$focus['quantity']; ?> on hand</span>
+          </li>
         <?php endforeach; ?>
-      </select>
-    </label>
-
-    <div class="filter-actions">
-      <?php if ($isRoot): ?>
-        <button class="btn primary" type="submit">Filter</button>
-        <a class="btn secondary" href="inventory.php">Reset</a>
-      <?php else: ?>
-        <span class="muted small">Filtering limited to your sector.</span>
-      <?php endif; ?>
-    </div>
-  </form>
+        <?php if (!$lowStockItems): ?>
+          <li class="muted">All items healthy.</li>
+        <?php endif; ?>
+      </ul>
+    </article>
+  </div>
 </section>
 
-<?php if ($canManage): ?>
-<section class="card">
-  <div class="card-header">
-    <h2>Add Item</h2>
-  </div>
+<?php if ($errors): ?>
+  <section class="card card--alert">
+    <div class="flash flash-error"><?php echo sanitize(implode(' ', $errors)); ?></div>
+  </section>
+<?php endif; ?>
 
-  <!-- Compact multi-field form -->
-  <form method="post" class="filters" autocomplete="off">
-    <label>Name
-      <input type="text" name="name" required placeholder="e.g. Light bulb E27">
-    </label>
-
-    <label>SKU
-      <input type="text" name="sku" placeholder="Optional SKU">
-    </label>
-
-    <label>Initial Quantity
-      <input type="number" name="quantity" min="0" value="0">
-    </label>
-
-    <label>Location
-      <input type="text" name="location" placeholder="Aisle / Shelf">
-    </label>
-
-    <?php if ($isRoot): ?>
+<section class="card inventory-console">
+  <div class="inventory-console__grid">
+    <form method="get" class="filters" autocomplete="off">
+      <h2 class="filters__title">Sector Lens</h2>
       <label>Sector
-        <select name="sector_id">
-          <option value="null">Unassigned</option>
+        <select name="sector" <?php echo $isRoot ? '' : 'disabled'; ?>>
+          <option value="all" <?php echo ($sectorFilter === '' || $sectorFilter === 'all') ? 'selected' : ''; ?>>All</option>
+          <option value="null" <?php echo $sectorFilter === 'null' ? 'selected' : ''; ?>>Unassigned</option>
           <?php foreach ((array)$sectorOptions as $sector): ?>
-            <option value="<?php echo (int)$sector['id']; ?>"><?php echo sanitize((string)$sector['name']); ?></option>
+            <option value="<?php echo (int)$sector['id']; ?>" <?php echo ((string)$sector['id'] === (string)$sectorFilter) ? 'selected' : ''; ?>>
+              <?php echo sanitize((string)$sector['name']); ?>
+            </option>
           <?php endforeach; ?>
         </select>
       </label>
+
+      <div class="filter-actions">
+        <?php if ($isRoot): ?>
+          <button class="btn primary" type="submit">Apply lens</button>
+          <a class="btn secondary" href="inventory.php">Reset</a>
+        <?php else: ?>
+          <span class="muted small">Filtering limited to your sector.</span>
+        <?php endif; ?>
+      </div>
+    </form>
+
+    <?php if ($canManage): ?>
+    <form method="post" class="filters filters--panel" autocomplete="off">
+      <h2 class="filters__title">Create inventory node</h2>
+      <label>Name
+        <input type="text" name="name" required placeholder="Quantum smart bulb E27">
+      </label>
+
+      <label>SKU
+        <input type="text" name="sku" placeholder="Optional SKU">
+      </label>
+
+      <label>Initial quantity
+        <input type="number" name="quantity" min="0" value="0">
+      </label>
+
+      <label>Location
+        <input type="text" name="location" placeholder="Aisle / Shelf">
+      </label>
+
+      <?php if ($isRoot): ?>
+        <label>Sector
+          <select name="sector_id">
+            <option value="null">Unassigned</option>
+            <?php foreach ((array)$sectorOptions as $sector): ?>
+              <option value="<?php echo (int)$sector['id']; ?>"><?php echo sanitize((string)$sector['name']); ?></option>
+            <?php endforeach; ?>
+          </select>
+        </label>
+      <?php endif; ?>
+
+      <div class="filter-actions">
+        <input type="hidden" name="action" value="create_item">
+        <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
+        <button class="btn primary" type="submit">Launch node</button>
+      </div>
+    </form>
     <?php endif; ?>
-
-    <div class="filter-actions">
-      <input type="hidden" name="action" value="create_item">
-      <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
-      <button class="btn primary" type="submit">Add</button>
-    </div>
-  </form>
+  </div>
 </section>
-<?php endif; ?>
 
-<section class="card">
-  <div class="card-header">
-    <h2>Items</h2>
+
+<section class="inventory-layout">
+  <div class="inventory-layout__main card">
+    <header class="inventory-header">
+      <div>
+        <h2>Live inventory map</h2>
+        <p class="muted">Search, filter, and orchestrate movements without leaving the grid.</p>
+      </div>
+      <div class="inventory-search">
+        <input type="search" placeholder="Search by name, SKU, location" data-inventory-search>
+      </div>
+    </header>
+
+    <div class="inventory-quick-filters" role="group" aria-label="Quick filters">
+      <button type="button" class="chip-toggle is-active" data-filter="all">All</button>
+      <button type="button" class="chip-toggle" data-filter="low">Low stock</button>
+      <button type="button" class="chip-toggle" data-filter="out">Out of stock</button>
+      <button type="button" class="chip-toggle" data-filter="healthy">Healthy</button>
+    </div>
+
+    <div class="inventory-table-wrapper">
+      <table class="table table--cards compact-rows inventory-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>SKU</th>
+            <th>Sector</th>
+            <th>Quantity</th>
+            <th>Location</th>
+            <th class="text-right">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($items as $item): ?>
+          <?php
+            $quantity = (int)($item['quantity'] ?? 0);
+            $skuValue = trim((string)($item['sku'] ?? ''));
+            $locationValue = trim((string)($item['location'] ?? ''));
+            $sectorText = sector_name_by_id((array)$sectorOptions, $item['sector_id']);
+            $sectorLabel = $sectorText !== '' ? $sectorText : 'Unassigned';
+            $state = $quantity === 0 ? 'out' : ($quantity <= $lowStockThreshold ? 'low' : 'healthy');
+          ?>
+          <tr data-inventory-row data-state="<?php echo $state; ?>" data-name="<?php echo sanitize(strtolower((string)$item['name'])); ?>" data-sku="<?php echo sanitize(strtolower($skuValue)); ?>" data-location="<?php echo sanitize(strtolower($locationValue)); ?>" data-quantity="<?php echo $quantity; ?>">
+            <td data-label="Name">
+              <strong><?php echo sanitize((string)$item['name']); ?></strong>
+              <?php if ($state !== 'healthy'): ?>
+                <span class="status-pill status-pill--<?php echo $state; ?>"><?php echo $state === 'out' ? 'Out of stock' : 'Low'; ?></span>
+              <?php endif; ?>
+            </td>
+            <td data-label="SKU">
+              <?php echo $skuValue !== '' ? sanitize($skuValue) : '<em class="muted">—</em>'; ?>
+            </td>
+            <td data-label="Sector">
+              <?php echo $sectorText !== '' ? sanitize($sectorText) : '<span class="badge">Unassigned</span>'; ?>
+            </td>
+            <td data-label="Quantity"><strong><?php echo $quantity; ?></strong></td>
+            <td data-label="Location">
+              <?php echo $locationValue !== '' ? sanitize($locationValue) : '<em class="muted">—</em>'; ?>
+            </td>
+            <td data-label="Actions" class="text-right">
+              <details class="item-actions">
+                <summary class="btn small">Manage</summary>
+                <div class="item-actions__box">
+                  <?php if ($canManage && ($isRoot || (int)$item['sector_id'] === (int)$userSectorId)): ?>
+                    <form method="post" class="filters stack" autocomplete="off">
+                      <h3>Edit basics</h3>
+                      <label>Name
+                        <input type="text" name="name" value="<?php echo sanitize((string)$item['name']); ?>" required>
+                      </label>
+                      <label>SKU
+                        <input type="text" name="sku" value="<?php echo sanitize($skuValue); ?>">
+                      </label>
+                      <label>Location
+                        <input type="text" name="location" value="<?php echo sanitize($locationValue); ?>">
+                      </label>
+                      <?php if ($isRoot): ?>
+                        <label>Sector
+                          <select name="sector_id">
+                            <option value="null" <?php echo $item['sector_id'] === null ? 'selected' : ''; ?>>Unassigned</option>
+                            <?php foreach ((array)$sectorOptions as $sector): ?>
+                              <option value="<?php echo (int)$sector['id']; ?>" <?php echo ((string)$item['sector_id'] === (string)$sector['id']) ? 'selected' : ''; ?>>
+                                <?php echo sanitize((string)$sector['name']); ?>
+                              </option>
+                            <?php endforeach; ?>
+                          </select>
+                        </label>
+                      <?php endif; ?>
+                      <div class="filter-actions">
+                        <input type="hidden" name="action" value="update_item">
+                        <input type="hidden" name="item_id" value="<?php echo (int)$item['id']; ?>">
+                        <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
+                        <button class="btn small" type="submit">Save changes</button>
+                      </div>
+                    </form>
+
+                    <form method="post" class="filters stack" autocomplete="off">
+                      <h3>Record movement</h3>
+                      <label>Direction
+                        <select name="direction">
+                          <option value="in">In</option>
+                          <option value="out">Out</option>
+                        </select>
+                      </label>
+                      <label>Amount
+                        <input type="number" name="amount" min="1" value="1" required>
+                      </label>
+                      <label>Reason
+                        <input type="text" name="reason" placeholder="Optional reason">
+                      </label>
+                      <div class="filter-actions">
+                        <input type="hidden" name="action" value="move_stock">
+                        <input type="hidden" name="item_id" value="<?php echo (int)$item['id']; ?>">
+                        <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
+                        <button class="btn small primary" type="submit">Record</button>
+                      </div>
+                    </form>
+                  <?php else: ?>
+                    <p class="muted small">No management rights for this item.</p>
+                  <?php endif; ?>
+
+                  <h3 class="movements-title">Recent movements</h3>
+                  <ul class="movements">
+                    <?php foreach ($movementsByItem[$item['id']] ?? [] as $move): ?>
+                      <li>
+                        <span class="chip <?php echo $move['direction'] === 'out' ? 'chip-out':'chip-in'; ?>">
+                          <?php echo sanitize(strtoupper((string)$move['direction'])); ?>
+                        </span>
+                        <strong><?php echo (int)$move['amount']; ?></strong>
+                        <span class="muted small">
+                          &middot; <?php echo sanitize((string)$move['ts']); ?>
+                          <?php if (!empty($move['reason'])): ?> &middot; <?php echo sanitize((string)$move['reason']); ?><?php endif; ?>
+                        </span>
+                      </li>
+                    <?php endforeach; ?>
+                    <?php if (empty($movementsByItem[$item['id']])): ?>
+                      <li class="muted small">No movements yet.</li>
+                    <?php endif; ?>
+                  </ul>
+                </div>
+              </details>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
   </div>
 
-  <!-- table--cards switches rows into cards on mobile -->
-  <table class="table table--cards compact-rows">
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>SKU</th>
-        <th>Sector</th>
-        <th>Quantity</th>
-        <th>Location</th>
-        <th class="text-right">Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-    <?php foreach ($items as $item): ?>
-      <tr>
-        <td data-label="Name"><?php echo sanitize((string)$item['name']); ?></td>
+  <aside class="inventory-layout__aside">
+    <section class="card mini-card">
+      <h3>Top reserves</h3>
+      <ul class="mini-list">
+        <?php foreach ($topItems as $top): ?>
+          <li>
+            <strong><?php echo sanitize((string)$top['name']); ?></strong>
+            <span><?php echo (int)$top['quantity']; ?> units</span>
+          </li>
+        <?php endforeach; ?>
+        <?php if (!$topItems): ?>
+          <li class="muted">No inventory yet.</li>
+        <?php endif; ?>
+      </ul>
+    </section>
 
-        <td data-label="SKU">
-          <?php echo !empty($item['sku']) ? sanitize((string)$item['sku']) : '<em class="muted">—</em>'; ?>
-        </td>
+    <section class="card mini-card">
+      <h3>Sector load</h3>
+      <ul class="mini-list">
+        <?php foreach ($sectorBreakdownDisplay as $sectorRow): ?>
+          <li>
+            <strong><?php echo sanitize($sectorRow['label']); ?></strong>
+            <span><?php echo number_format($sectorRow['items']); ?> items · <?php echo number_format($sectorRow['quantity']); ?> qty</span>
+          </li>
+        <?php endforeach; ?>
+        <?php if (!$sectorBreakdownDisplay): ?>
+          <li class="muted">No sectors associated.</li>
+        <?php endif; ?>
+      </ul>
+    </section>
 
-        <td data-label="Sector">
-          <?php
-            $sn = sector_name_by_id((array)$sectorOptions, $item['sector_id']);
-            echo $sn !== '' ? sanitize($sn) : '<span class="badge">Unassigned</span>';
-          ?>
-        </td>
-
-        <td data-label="Quantity"><strong><?php echo (int)$item['quantity']; ?></strong></td>
-
-        <td data-label="Location">
-          <?php echo !empty($item['location']) ? sanitize((string)$item['location']) : '<em class="muted">—</em>'; ?>
-        </td>
-
-        <td data-label="Actions" class="text-right">
-          <details class="item-actions">
-            <summary class="btn small">Manage</summary>
-            <div class="item-actions__box">
-              <?php if ($canManage && ($isRoot || (int)$item['sector_id'] === (int)$userSectorId)): ?>
-                <!-- Update item -->
-                <form method="post" class="filters" style="margin-top:.5rem;">
-                  <label>Name
-                    <input type="text" name="name" value="<?php echo sanitize((string)$item['name']); ?>" required>
-                  </label>
-                  <label>SKU
-                    <input type="text" name="sku" value="<?php echo sanitize((string)($item['sku'] ?? '')); ?>">
-                  </label>
-                  <label>Location
-                    <input type="text" name="location" value="<?php echo sanitize((string)($item['location'] ?? '')); ?>">
-                  </label>
-                  <?php if ($isRoot): ?>
-                    <label>Sector
-                      <select name="sector_id">
-                        <option value="null" <?php echo $item['sector_id'] === null ? 'selected':''; ?>>Unassigned</option>
-                        <?php foreach ((array)$sectorOptions as $sector): ?>
-                          <option value="<?php echo (int)$sector['id']; ?>" <?php echo ((string)$item['sector_id'] === (string)$sector['id']) ? 'selected' : ''; ?>>
-                            <?php echo sanitize((string)$sector['name']); ?>
-                          </option>
-                        <?php endforeach; ?>
-                      </select>
-                    </label>
-                  <?php endif; ?>
-                  <div class="filter-actions">
-                    <input type="hidden" name="action" value="update_item">
-                    <input type="hidden" name="item_id" value="<?php echo (int)$item['id']; ?>">
-                    <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
-                    <button class="btn small" type="submit">Save</button>
-                  </div>
-                </form>
-
-                <!-- Move stock -->
-                <form method="post" class="filters" style="margin-top:.5rem;">
-                  <label>Direction
-                    <select name="direction">
-                      <option value="in">In</option>
-                      <option value="out">Out</option>
-                    </select>
-                  </label>
-                  <label>Amount
-                    <input type="number" name="amount" min="1" value="1" required>
-                  </label>
-                  <label>Reason
-                    <input type="text" name="reason" placeholder="Optional reason">
-                  </label>
-                  <div class="filter-actions">
-                    <input type="hidden" name="action" value="move_stock">
-                    <input type="hidden" name="item_id" value="<?php echo (int)$item['id']; ?>">
-                    <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
-                    <button class="btn small primary" type="submit">Record</button>
-                  </div>
-                </form>
-              <?php else: ?>
-                <p class="muted small" style="margin:.5rem 0 0;">No management rights for this item.</p>
-              <?php endif; ?>
-
-              <!-- Recent movements -->
-              <h3 class="movements-title">Recent Movements</h3>
-              <ul class="movements">
-                <?php foreach ($movementsByItem[$item['id']] ?? [] as $move): ?>
-                  <li>
-                    <span class="chip <?php echo $move['direction'] === 'out' ? 'chip-out':'chip-in'; ?>">
-                      <?php echo sanitize(strtoupper((string)$move['direction'])); ?>
-                    </span>
-                    <strong><?php echo (int)$move['amount']; ?></strong>
-                    <span class="muted small">
-                      &middot; <?php echo sanitize((string)$move['ts']); ?>
-                      <?php if (!empty($move['reason'])): ?> &middot; <?php echo sanitize((string)$move['reason']); ?><?php endif; ?>
-                    </span>
-                  </li>
-                <?php endforeach; ?>
-                <?php if (empty($movementsByItem[$item['id']])): ?>
-                  <li class="muted small">No movements yet.</li>
-                <?php endif; ?>
-              </ul>
+    <section class="card mini-card">
+      <h3>Movement stream</h3>
+      <ul class="movement-stream">
+        <?php foreach ($recentMovements as $move): ?>
+          <li>
+            <div class="movement-stream__icon <?php echo ($move['direction'] === 'out') ? 'is-out' : 'is-in'; ?>" aria-hidden="true"></div>
+            <div>
+              <strong><?php echo sanitize((string)$move['item_name']); ?></strong>
+              <p class="muted small">
+                <?php echo (int)$move['amount']; ?> <?php echo $move['direction'] === 'out' ? 'dispatched' : 'received'; ?>
+                · <?php echo sanitize((string)($move['user_name'] ?? 'System')); ?>
+                · <?php echo sanitize((string)$move['ts']); ?>
+              </p>
             </div>
-          </details>
-        </td>
-      </tr>
-    <?php endforeach; ?>
-    </tbody>
-  </table>
+          </li>
+        <?php endforeach; ?>
+        <?php if (!$recentMovements): ?>
+          <li class="muted">No movements recorded.</li>
+        <?php endif; ?>
+      </ul>
+    </section>
+  </aside>
 </section>
 
-<!-- Small page-specific polish; move to app.css if you like -->
-<style>
-.item-actions summary.btn.small { cursor: pointer; }
-.item-actions[open] summary.btn.small { opacity: .85; }
+<script>
+(function(){
+  const searchInput = document.querySelector('[data-inventory-search]');
+  const rows = Array.from(document.querySelectorAll('[data-inventory-row]'));
+  const filterButtons = document.querySelectorAll('.inventory-quick-filters [data-filter]');
+  if (!rows.length) return;
 
-.item-actions__box{
-  margin-top:.4rem;
-  padding:.6rem .7rem;
-  border:1px solid var(--line,#e7ecf3);
-  background:#fff;
-  border-radius:12px;
-  box-shadow: 0 1px 0 rgba(0,0,0,.02);
-}
+  let activeFilter = 'all';
 
-/* Movements list */
-.movements-title{
-  margin:.6rem 0 .25rem;
-  font-size:.9rem;
-  font-weight:700;
-}
-.movements{
-  list-style:none; padding:0; margin:.2rem 0 0;
-  display:flex; flex-direction:column; gap:.35rem;
-}
-.movements li{
-  display:flex; align-items:center; gap:.5rem; line-height:1.2;
-}
-.chip{
-  display:inline-block; padding:.15rem .5rem; border-radius:999px; font-size:.75rem; font-weight:700;
-  background:#eef2ff; color:#111827;
-}
-.chip-in{ background:#eaf7ef; }
-.chip-out{ background:#fff1f2; }
-</style>
+  const normalize = (value) => (value || '').toString().toLowerCase();
+
+  const applyFilters = () => {
+    const term = normalize(searchInput ? searchInput.value : '');
+    rows.forEach((row) => {
+      const state = row.dataset.state || 'all';
+      const matchesFilter = activeFilter === 'all' ? true : state === activeFilter;
+      const composite = [row.dataset.name, row.dataset.sku, row.dataset.location].join(' ');
+      const matchesSearch = term === '' ? true : composite.includes(term);
+      row.style.display = matchesFilter && matchesSearch ? '' : 'none';
+    });
+  };
+
+  filterButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      filterButtons.forEach((btn) => btn.classList.remove('is-active'));
+      button.classList.add('is-active');
+      activeFilter = button.dataset.filter || 'all';
+      applyFilters();
+    });
+  });
+
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      window.requestAnimationFrame(applyFilters);
+    });
+  }
+})();
+</script>
 
 <?php include __DIR__ . '/includes/footer.php'; ?>
