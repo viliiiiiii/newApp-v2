@@ -754,21 +754,62 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
         return null;
     }
 
-    function can(string $perm): bool {
-        $role = current_user_role_key();
-        if ($role === 'root') {
+    function current_user_is_root(): bool {
+        return current_user_role_key() === 'root';
+    }
+
+    function has_permission(?int $userId, string $code): bool {
+        $code = trim($code);
+        if ($code === '') {
+            return false;
+        }
+
+        if (current_user_is_root()) {
             return true;
         }
-        $map = [
-            'viewer' => ['view', 'download'],
-            'admin'  => ['view', 'download', 'edit', 'inventory_manage'],
-        ];
-        return in_array($perm, $map[$role] ?? [], true);
+
+        $user = current_user();
+        if ($userId === null && $user && isset($user['id'])) {
+            $userId = (int)$user['id'];
+        }
+
+        if (!$userId) {
+            return false;
+        }
+
+        static $cache = [];
+        $codeKey = strtolower($code);
+        if (isset($cache[$userId][$codeKey])) {
+            return $cache[$userId][$codeKey];
+        }
+
+        $has = false;
+        try {
+            $stmt = get_pdo('core')->prepare('SELECT 1
+                FROM permissions p
+                INNER JOIN role_permissions rp ON rp.permission_id = p.id
+                INNER JOIN user_roles ur ON ur.role_id = rp.role_id
+                WHERE ur.user_id = :uid AND p.code = :code
+                LIMIT 1');
+            $stmt->execute([
+                ':uid'  => $userId,
+                ':code' => $code,
+            ]);
+            $has = (bool)$stmt->fetchColumn();
+        } catch (Throwable $e) {
+            $has = false;
+        }
+
+        return $cache[$userId][$codeKey] = $has;
+    }
+
+    function can(string $perm): bool {
+        return has_permission(null, $perm);
     }
 
     function require_perm(string $perm): void {
         require_login();
-        if (!can($perm)) {
+        if (!has_permission(null, $perm)) {
             http_response_code(403);
             exit('Forbidden');
         }
